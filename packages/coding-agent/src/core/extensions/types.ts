@@ -1697,7 +1697,7 @@ export interface ExtensionAPI {
 	/**
 	 * Send a user message to the agent. Always triggers a turn.
 	 * When the agent is streaming, use deliverAs to specify how to queue the message.
-	 * Set expandPromptTemplates to dispatch extension commands and expand skill commands and prompt templates.
+	 * Set expandPromptTemplates to dispatch extension commands and expand skill commands, inline skill mentions, and prompt templates.
 	 */
 	sendUserMessage(
 		content: string | (TextContent | ImageContent)[],

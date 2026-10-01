@@ -131,6 +131,7 @@ import {
 	type SessionProjection,
 } from "./session-manager.ts";
 import { type CacheWarmingMode, DEFAULT_TOOL_NAMES, type SettingsManager } from "./settings-manager.ts";
+import { expandSkillInvocations } from "./skill-expansion.ts";
 import type { SlashCommandInfo } from "./slash-commands.ts";
 import { BUILTIN_PATH_PREFIX, createSyntheticSourceInfo, isSyntheticPath, type SourceInfo } from "./source-info.ts";
 import {
@@ -152,33 +153,6 @@ import {
 	VIRTUAL_MODEL_STATE_ENTRY,
 	type VirtualModelStateData,
 } from "./virtual-models.ts";
-
-// ============================================================================
-// Skill Block Parsing
-// ============================================================================
-
-/** Parsed skill block from a user message */
-export interface ParsedSkillBlock {
-	name: string;
-	location: string;
-	content: string;
-	userMessage: string | undefined;
-}
-
-/**
- * Parse a skill block from message text.
- * Returns null if the text doesn't contain a skill block.
- */
-export function parseSkillBlock(text: string): ParsedSkillBlock | null {
-	const match = text.match(/^<skill name="([^"]+)" location="([^"]+)">\n([\s\S]*?)\n<\/skill>(?:\n\n([\s\S]+))?$/);
-	if (!match) return null;
-	return {
-		name: match[1],
-		location: match[2],
-		content: match[3],
-		userMessage: match[4]?.trim() || undefined,
-	};
-}
 
 /** Tool execution events of calls a tool made through `ctx.executeTool()` carry `parentToolCallId`. */
 type WithParentToolCallId<E> = E extends {
@@ -302,7 +276,7 @@ export type PromptDisposition = QueuedInputDisposition | "started";
 
 /** Options for AgentSession.prompt() */
 export interface PromptOptions {
-	/** Whether to dispatch extension commands and expand skill commands and prompt templates (default: true) */
+	/** Whether to dispatch extension commands and expand skill commands, inline skill mentions, and prompt templates (default: true) */
 	expandPromptTemplates?: boolean;
 	/** Image attachments */
 	images?: ImageContent[];
@@ -1988,11 +1962,10 @@ export class AgentSession {
 		}
 		const { text: currentText, images: currentImages } = processedInput;
 
-		// Expand skill commands (/skill:name args) and prompt templates (/template args)
+		// Expand skill commands, inline skill mentions, and prompt templates (/template args)
 		let expandedText = currentText;
 		if (expandPromptTemplates) {
-			expandedText = this._expandSkillCommand(expandedText);
-			expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+			expandedText = this._expandUserPrompt(expandedText);
 		}
 
 		// If streaming, queue via steer() or followUp() based on option
@@ -2126,34 +2099,33 @@ export class AgentSession {
 	}
 
 	/**
-	 * Expand skill commands (/skill:name args) to their full content.
-	 * Returns the expanded text, or the original text if not a skill command or skill not found.
-	 * Emits errors via extension runner if file read fails.
+	 * Expand the user's prompt: a leading /skill:name command, inline /skill:name mentions,
+	 * and prompt templates. Inline mentions keep their text and get their skill content
+	 * injected ahead of the prompt as skill blocks. Skill mentions are collected from the
+	 * raw input first so expanded skill and template content is never scanned for mentions.
 	 */
-	private _expandSkillCommand(text: string): string {
-		if (!text.startsWith("/skill:")) return text;
-
-		const spaceIndex = text.indexOf(" ");
-		const skillName = spaceIndex === -1 ? text.slice(7) : text.slice(7, spaceIndex);
-		const args = spaceIndex === -1 ? "" : text.slice(spaceIndex + 1).trim();
-
-		const skill = this.resourceLoader.getSkills().skills.find((s) => s.name === skillName);
-		if (!skill) return text; // Unknown skill, pass through
-
-		try {
-			const content = readFileSync(skill.filePath, "utf-8");
-			const body = stripFrontmatter(content).trim();
-			const skillBlock = `<skill name="${skill.name}" location="${skill.filePath}">\nReferences are relative to ${skill.baseDir}.\n\n${body}\n</skill>`;
-			return args ? `${skillBlock}\n\n${args}` : skillBlock;
-		} catch (err) {
+	private _expandUserPrompt(text: string): string {
+		const skillExpansion = expandSkillInvocations(text, {
+			getSkill: (skillName) => this.resourceLoader.getSkills().skills.find((skill) => skill.name === skillName),
+			readSkillBody: (skill) => stripFrontmatter(readFileSync(skill.filePath, "utf-8")).trim(),
+		});
+		for (const failure of skillExpansion.failures) {
 			// Emit error like extension commands do
 			this._extensionRunner.emitError({
-				extensionPath: skill.filePath,
+				extensionPath: failure.skill.filePath,
 				event: "skill_expansion",
-				error: err instanceof Error ? err.message : String(err),
+				error: failure.message,
 			});
-			return text; // Return original on error
 		}
+
+		// Templates expand before inline blocks are prepended, so a leading /template
+		// command is still visible at the start of the text.
+		const templated = expandPromptTemplate(skillExpansion.text, [...this.promptTemplates]);
+		if (skillExpansion.inlineBlocks.length === 0) return templated;
+		// Skill blocks lead the message so parseSkillBlocks() can split them from the prompt
+		// for collapsible rendering in the transcript and HTML export.
+		const inlineBlocks = skillExpansion.inlineBlocks.join("\n\n");
+		return templated ? `${inlineBlocks}\n\n${templated}` : inlineBlocks;
 	}
 
 	private async _queueUserInput(
@@ -2174,8 +2146,8 @@ export class AgentSession {
 		);
 		if (!processedInput) return "handled";
 
-		let expandedText = this._expandSkillCommand(processedInput.text);
-		expandedText = expandPromptTemplate(expandedText, [...this.promptTemplates]);
+		// Expand skill commands, inline skill mentions, and prompt templates
+		const expandedText = this._expandUserPrompt(processedInput.text);
 
 		if (behavior === "steer") {
 			await this._queueSteer(expandedText, processedInput.images);
@@ -2189,7 +2161,7 @@ export class AgentSession {
 	 * Queue a steering message while the agent is running.
 	 * Delivered after the current assistant turn finishes executing its tool calls,
 	 * before the next LLM call.
-	 * Expands skill commands and prompt templates. Errors on extension commands.
+	 * Expands skill commands, inline skill mentions, and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
 	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
@@ -2205,7 +2177,7 @@ export class AgentSession {
 	/**
 	 * Queue a follow-up message to be processed after the agent finishes.
 	 * Delivered only when agent has no more tool calls or steering messages.
-	 * Expands skill commands and prompt templates. Errors on extension commands.
+	 * Expands skill commands, inline skill mentions, and prompt templates. Errors on extension commands.
 	 * @param images Optional image attachments to include with the message
 	 * @param options Input source; defaults to interactive
 	 * @throws Error if text is an extension command
@@ -2346,7 +2318,7 @@ export class AgentSession {
 	 *
 	 * @param content User message content (string or content array)
 	 * @param options.deliverAs Delivery mode when streaming: "steer" or "followUp"
-	 * @param options.expandPromptTemplates Whether to dispatch extension commands and expand skill commands and prompt templates. Default: false.
+	 * @param options.expandPromptTemplates Whether to dispatch extension commands and expand skill commands, inline skill mentions, and prompt templates. Default: false.
 	 */
 	async sendUserMessage(
 		content: string | (TextContent | ImageContent)[],

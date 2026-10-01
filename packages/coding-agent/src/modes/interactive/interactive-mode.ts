@@ -65,7 +65,7 @@ import {
 	getDocsPath,
 	VERSION,
 } from "../../config.ts";
-import { type AgentSession, type AgentSessionEvent, parseSkillBlock } from "../../core/agent-session.ts";
+import type { AgentSession, AgentSessionEvent } from "../../core/agent-session.ts";
 import { type AgentSessionRuntime, SessionImportFileNotFoundError } from "../../core/agent-session-runtime.ts";
 import type { AgentSessionRuntimeDiagnostic } from "../../core/agent-session-services.ts";
 import {
@@ -114,6 +114,7 @@ import {
 	type UsageEntry,
 } from "../../core/session-manager.ts";
 import type { FullscreenExitOutput, TuiMode } from "../../core/settings-manager.ts";
+import { parseSkillBlocks } from "../../core/skill-block.ts";
 import { BUILTIN_SLASH_COMMANDS } from "../../core/slash-commands.ts";
 import type { SourceInfo } from "../../core/source-info.ts";
 import { isInstallTelemetryEnabled } from "../../core/telemetry.ts";
@@ -3894,20 +3895,22 @@ export class InteractiveMode {
 					if (this.chatContainer.children.length > 0) {
 						this.chatContainer.addChild(new Spacer(1));
 					}
-					const skillBlock = parseSkillBlock(textContent);
-					if (skillBlock) {
-						// Render skill block (collapsible)
-						const component = new SkillInvocationMessageComponent(
-							skillBlock,
-							this.getMarkdownThemeWithSettings(),
-						);
-						component.setExpanded(this.toolOutputExpanded);
-						this.chatContainer.addChild(component);
-						// Render user message separately if present
-						if (skillBlock.userMessage) {
+					const skillInvocation = parseSkillBlocks(textContent);
+					if (skillInvocation) {
+						// Render each skill invocation (collapsible)
+						for (const skillBlock of skillInvocation.skills) {
+							const component = new SkillInvocationMessageComponent(
+								skillBlock,
+								this.getMarkdownThemeWithSettings(),
+							);
+							component.setExpanded(this.toolOutputExpanded);
+							this.chatContainer.addChild(component);
+						}
+						// Render the user's prompt separately if present
+						if (skillInvocation.userMessage) {
 							this.chatContainer.addChild(new Spacer(1));
 							const userComponent = new UserMessageComponent(
-								skillBlock.userMessage,
+								skillInvocation.userMessage,
 								this.getMarkdownThemeWithSettings(),
 								this.outputPad,
 								this.getMarkdownTransformers(),

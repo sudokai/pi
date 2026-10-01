@@ -3073,6 +3073,149 @@ describe("Editor component", () => {
 			assert.strictEqual(editor.getText(), "/help ");
 			assert.strictEqual(editor.isShowingAutocomplete(), false);
 		});
+
+		it("shows inline skill completions in the middle of a line and does not submit on Enter", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			let submitted = false;
+			editor.onSubmit = () => {
+				submitted = true;
+			};
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "skill:diagnose", description: "Diagnose bugs" }], process.cwd()),
+			);
+			editor.setText("hello ");
+			for (const ch of "/di") editor.handleInput(ch);
+			await flushAutocomplete();
+
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			editor.handleInput("\r");
+			assert.strictEqual(submitted, false);
+			assert.strictEqual(editor.getText(), "hello /skill:diagnose ");
+		});
+
+		it("completes an inline skill prefix with Tab when the suggestion menu is closed", async (t) => {
+			for (const source of ["setText", "paste", "history", "dismissed menu"]) {
+				await t.test(source, async () => {
+					const editor = new Editor(createTestTUI(), defaultEditorTheme);
+					editor.setAutocompleteProvider(
+						new CombinedAutocompleteProvider(
+							[{ name: "skill:diagnose", description: "Diagnose bugs" }],
+							process.cwd(),
+						),
+					);
+					if (source === "paste") {
+						editor.handleInput("\x1b[200~please /di\x1b[201~");
+					} else if (source === "history") {
+						editor.addToHistory("please /di");
+						editor.handleInput("\x1b[A");
+						editor.handleInput("\x05");
+					} else if (source === "dismissed menu") {
+						editor.setText("please ");
+						for (const ch of "/di") editor.handleInput(ch);
+						await flushAutocomplete();
+						assert.strictEqual(editor.isShowingAutocomplete(), true);
+						editor.handleInput("\x1b");
+					} else {
+						editor.setText("please /di");
+					}
+					await flushAutocomplete();
+					assert.strictEqual(editor.isShowingAutocomplete(), false);
+
+					editor.handleInput("\t");
+					await flushAutocomplete();
+
+					assert.strictEqual(editor.isShowingAutocomplete(), true);
+					editor.handleInput("\t");
+					assert.strictEqual(editor.getText(), "please /skill:diagnose ");
+				});
+			}
+		});
+
+		it("accepts inline skill completion after a slash-led earlier token without submitting", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			let submitted = false;
+			editor.onSubmit = () => {
+				submitted = true;
+			};
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "skill:diagnose", description: "Diagnose bugs" }], process.cwd()),
+			);
+			editor.setText("/tmp/x and ");
+			for (const ch of "/di") editor.handleInput(ch);
+			await flushAutocomplete();
+
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			editor.handleInput("\r");
+			assert.strictEqual(submitted, false);
+			assert.strictEqual(editor.getText(), "/tmp/x and /skill:diagnose ");
+		});
+
+		it("completes '/model /g' command arguments through the editor", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider(
+					[
+						{
+							name: "model",
+							description: "Switch model",
+							getArgumentCompletions: (argumentPrefix) =>
+								argumentPrefix.startsWith("/g") ? [{ value: "gpt-5", label: "gpt-5" }] : null,
+						},
+					],
+					process.cwd(),
+				),
+			);
+			editor.setText("/model ");
+			for (const ch of "/g") editor.handleInput(ch);
+			await flushAutocomplete();
+
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			editor.handleInput("\t");
+			assert.strictEqual(editor.getText(), "/model gpt-5");
+		});
+
+		it("shows skill completions at the start of a new line", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "skill:diagnose", description: "Diagnose bugs" }], process.cwd()),
+			);
+			editor.setText("first line\n");
+			for (const ch of "/di") editor.handleInput(ch);
+			await flushAutocomplete();
+
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			editor.handleInput("\r");
+			assert.strictEqual(editor.getText(), "first line\n/skill:diagnose ");
+		});
+
+		it("does not open path suggestions for a bare slash typed inline", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "skill:diagnose", description: "Diagnose bugs" }], process.cwd()),
+			);
+			editor.setText("hello ");
+			editor.handleInput("/");
+			await flushAutocomplete();
+
+			assert.strictEqual(editor.isShowingAutocomplete(), false);
+		});
+
+		it("still accepts and submits slash commands at message start on Enter", async () => {
+			const editor = new Editor(createTestTUI(), defaultEditorTheme);
+			let submittedText: string | undefined;
+			editor.onSubmit = (text) => {
+				submittedText = text;
+			};
+			editor.setAutocompleteProvider(
+				new CombinedAutocompleteProvider([{ name: "reload", description: "Reload session" }], process.cwd()),
+			);
+			for (const ch of "/reloa") editor.handleInput(ch);
+			await flushAutocomplete();
+
+			assert.strictEqual(editor.isShowingAutocomplete(), true);
+			editor.handleInput("\r");
+			assert.strictEqual(submittedText, "/reload");
+		});
 	});
 
 	describe("Character jump (Ctrl+])", () => {

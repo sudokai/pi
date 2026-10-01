@@ -7,6 +7,7 @@ import { Type } from "typebox";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import type { ExtensionAPI, InputEvent } from "../../src/core/extensions/index.ts";
 import type { PromptTemplate } from "../../src/core/prompt-templates.ts";
+import { parseSkillBlocks } from "../../src/core/skill-block.ts";
 import { createSyntheticSourceInfo } from "../../src/core/source-info.ts";
 import { createTestResourceLoader } from "../utilities.ts";
 import { createHarness, getMessageText, type Harness } from "./harness.ts";
@@ -40,6 +41,63 @@ describe("AgentSession prompt characterization", () => {
 			}
 		}
 	});
+
+	function createSkillResourceLoader(...skillNames: string[]) {
+		const names = skillNames.length > 0 ? skillNames : ["test"];
+		const tempDir = join(tmpdir(), `pi-skill-${Date.now()}-${Math.random().toString(36).slice(2)}`);
+		mkdirSync(tempDir, { recursive: true });
+		tempDirs.push(tempDir);
+		const skills = names.map((skillName) => {
+			const skillPath = join(tempDir, `${skillName}-skill.md`);
+			writeFileSync(skillPath, "# Test Skill\n\nUse the skill body.");
+			return {
+				name: skillName,
+				description: "Test skill",
+				filePath: skillPath,
+				disableModelInvocation: false,
+				baseDir: tempDir,
+				sourceInfo: createSyntheticSourceInfo(skillPath, {
+					source: "local",
+					scope: "project",
+					origin: "top-level",
+					baseDir: tempDir,
+				}),
+			};
+		});
+		return {
+			...createTestResourceLoader(),
+			getSkills: () => ({ skills, diagnostics: [] }),
+		};
+	}
+
+	// Run a prompt-like action against a harness and return the expanded user message
+	// the provider received.
+	async function captureExpandedPrompt(harness: Harness, action: () => Promise<unknown>): Promise<string> {
+		let captured = "";
+		harness.setResponses([
+			(context) => {
+				const user = context.messages.find((message) => message.role === "user");
+				captured = user ? getMessageText(user) : "";
+				return fauxAssistantMessage("ok");
+			},
+		]);
+		await action();
+		return captured;
+	}
+
+	function createReviewTemplate(): PromptTemplate {
+		return {
+			name: "review",
+			description: "Review template",
+			content: "Review this code: $1",
+			filePath: "/virtual/review.md",
+			sourceInfo: createSyntheticSourceInfo("/virtual/review.md", {
+				source: "local",
+				scope: "temporary",
+				origin: "top-level",
+			}),
+		};
+	}
 
 	it("prompts while idle and records a single text response", async () => {
 		const harness = await createHarness();
@@ -198,114 +256,197 @@ describe("AgentSession prompt characterization", () => {
 	});
 
 	it("expands skill commands before sending the prompt", async () => {
-		const tempDir = join(tmpdir(), `pi-skill-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-		mkdirSync(tempDir, { recursive: true });
-		tempDirs.push(tempDir);
-		const skillPath = join(tempDir, "test-skill.md");
-		writeFileSync(skillPath, "# Test Skill\n\nUse the skill body.");
-
-		const resourceLoader = {
-			...createTestResourceLoader(),
-			getSkills: () => ({
-				skills: [
-					{
-						name: "test",
-						description: "Test skill",
-						filePath: skillPath,
-						disableModelInvocation: false,
-						baseDir: tempDir,
-						sourceInfo: createSyntheticSourceInfo(skillPath, {
-							source: "local",
-							scope: "project",
-							origin: "top-level",
-							baseDir: tempDir,
-						}),
-					},
-				],
-				diagnostics: [],
-			}),
-		};
-		const harness = await createHarness({ resourceLoader });
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
 		harnesses.push(harness);
-		let expandedPrompt = "";
-
-		harness.setResponses([
-			(context) => {
-				const user = context.messages.find((message) => message.role === "user");
-				expandedPrompt = user ? getMessageText(user) : "";
-				return fauxAssistantMessage("ok");
-			},
-		]);
-
-		await harness.session.prompt("/skill:test explain this");
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("/skill:test explain this"),
+		);
 
 		expect(expandedPrompt).toContain('<skill name="test" location="');
 		expect(expandedPrompt).toContain("Use the skill body.");
 		expect(expandedPrompt).toContain("explain this");
+
+		// The expanded message must parse back into collapsible skill blocks plus the
+		// prompt — the contract the transcript and HTML export renderers rely on.
+		const parsed = parseSkillBlocks(expandedPrompt);
+		expect(parsed?.skills.map((skill) => skill.name)).toEqual(["test"]);
+		expect(parsed?.userMessage).toBe("explain this");
+	});
+
+	it("expands inline skill mentions while keeping the prompt text", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("please use /skill:test here"),
+		);
+
+		expect(expandedPrompt).toContain('<skill name="test" location="');
+		expect(expandedPrompt).toContain("Use the skill body.");
+		expect(expandedPrompt).toContain("please use /skill:test here");
+	});
+
+	it("expands an inline skill mention on a later line", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("first line\n/skill:test do it"),
+		);
+
+		expect(expandedPrompt).toContain('<skill name="test" location="');
+		expect(expandedPrompt).toContain("first line\n/skill:test do it");
+	});
+
+	it("expands a leading skill command followed by a newline", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("/skill:test\nexplain this"),
+		);
+
+		expect(expandedPrompt).toContain('<skill name="test" location="');
+		expect(expandedPrompt).toContain("explain this");
+	});
+
+	it("leaves unknown inline skill mentions untouched", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("please use /skill:missing here"),
+		);
+
+		expect(expandedPrompt).toBe("please use /skill:missing here");
+	});
+
+	it("expands an inline skill mention whose name contains an underscore", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader("my_skill") });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("please use /skill:my_skill here"),
+		);
+
+		expect(expandedPrompt).toContain('<skill name="my_skill" location="');
+		expect(expandedPrompt).toContain("please use /skill:my_skill here");
+	});
+
+	it("expands an inline skill mention after leading whitespace at the start of the text", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt(" /skill:test explain this"),
+		);
+
+		expect(parseSkillBlocks(expandedPrompt)?.skills.map((skill) => skill.name)).toEqual(["test"]);
+		expect(expandedPrompt).toContain("explain this");
+	});
+
+	it("expands an inline skill mention after a leading opening bracket", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("(/skill:test) explain this"),
+		);
+
+		expect(parseSkillBlocks(expandedPrompt)?.skills.map((skill) => skill.name)).toEqual(["test"]);
+		expect(expandedPrompt).toContain("(/skill:test) explain this");
+	});
+
+	it("expands multiple inline skill mentions into parseable skill blocks with the prompt separate", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader("test", "other") });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("compare /skill:test with /skill:other"),
+		);
+
+		const parsed = parseSkillBlocks(expandedPrompt);
+		expect(parsed?.skills.map((skill) => skill.name)).toEqual(["test", "other"]);
+		expect(parsed?.userMessage).toBe("compare /skill:test with /skill:other");
+	});
+
+	it("expands a leading skill command and an inline mention into two parseable skill blocks", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader("test", "other") });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("/skill:test also compare with /skill:other"),
+		);
+
+		const parsed = parseSkillBlocks(expandedPrompt);
+		expect(parsed?.skills.map((skill) => skill.name).sort()).toEqual(["other", "test"]);
+		expect(parsed?.userMessage).toBe("also compare with /skill:other");
+	});
+
+	it("does not duplicate a skill mentioned as a leading command and inline", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("/skill:test\nalso see /skill:test"),
+		);
+
+		expect(parseSkillBlocks(expandedPrompt)?.skills.map((skill) => skill.name)).toEqual(["test"]);
+	});
+
+	it("expands a repeated inline skill mention only once", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("use /skill:test and again /skill:test"),
+		);
+
+		expect(parseSkillBlocks(expandedPrompt)?.skills.map((skill) => skill.name)).toEqual(["test"]);
+		expect(expandedPrompt).toContain("use /skill:test and again /skill:test");
+	});
+
+	it("expands an inline skill mention followed by punctuation", async () => {
+		const harness = await createHarness({ resourceLoader: createSkillResourceLoader() });
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("please use /skill:test."),
+		);
+
+		expect(expandedPrompt).toContain('<skill name="test" location="');
+		expect(expandedPrompt).toContain("please use /skill:test.");
+	});
+
+	it("expands a prompt template even when the message contains an inline skill mention", async () => {
+		const template = createReviewTemplate();
+		const harness = await createHarness({
+			resourceLoader: {
+				...createSkillResourceLoader(),
+				getPrompts: () => ({ prompts: [template], diagnostics: [] }),
+			},
+		});
+		harnesses.push(harness);
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.prompt("/review please use /skill:test"),
+		);
+
+		expect(expandedPrompt).toContain("Review this code:");
+		expect(expandedPrompt).toContain('<skill name="test" location="');
 	});
 
 	it("expands prompt templates before sending the prompt", async () => {
-		const template: PromptTemplate = {
-			name: "review",
-			description: "Review template",
-			content: "Review this code: $1",
-			filePath: "/virtual/review.md",
-			sourceInfo: createSyntheticSourceInfo("/virtual/review.md", {
-				source: "local",
-				scope: "temporary",
-				origin: "top-level",
-			}),
-		};
+		const template = createReviewTemplate();
 		const resourceLoader = {
 			...createTestResourceLoader(),
 			getPrompts: () => ({ prompts: [template], diagnostics: [] }),
 		};
 		const harness = await createHarness({ resourceLoader });
 		harnesses.push(harness);
-		let expandedPrompt = "";
-
-		harness.setResponses([
-			(context) => {
-				const user = context.messages.find((message) => message.role === "user");
-				expandedPrompt = user ? getMessageText(user) : "";
-				return fauxAssistantMessage("ok");
-			},
-		]);
-
-		await harness.session.prompt("/review src/index.ts");
+		const expandedPrompt = await captureExpandedPrompt(harness, () => harness.session.prompt("/review src/index.ts"));
 
 		expect(expandedPrompt).toBe("Review this code: src/index.ts");
 	});
 
 	it("sendUserMessage can opt into prompt template expansion", async () => {
-		const template: PromptTemplate = {
-			name: "review",
-			description: "Review template",
-			content: "Review this code: $1",
-			filePath: "/virtual/review.md",
-			sourceInfo: createSyntheticSourceInfo("/virtual/review.md", {
-				source: "local",
-				scope: "temporary",
-				origin: "top-level",
-			}),
-		};
+		const template = createReviewTemplate();
 		const resourceLoader = {
 			...createTestResourceLoader(),
 			getPrompts: () => ({ prompts: [template], diagnostics: [] }),
 		};
 		const harness = await createHarness({ resourceLoader });
 		harnesses.push(harness);
-		let expandedPrompt = "";
-
-		harness.setResponses([
-			(context) => {
-				const user = context.messages.find((message) => message.role === "user");
-				expandedPrompt = user ? getMessageText(user) : "";
-				return fauxAssistantMessage("ok");
-			},
-		]);
-
-		await harness.session.sendUserMessage("/review src/index.ts", { expandPromptTemplates: true });
+		const expandedPrompt = await captureExpandedPrompt(harness, () =>
+			harness.session.sendUserMessage("/review src/index.ts", { expandPromptTemplates: true }),
+		);
 
 		expect(expandedPrompt).toBe("Review this code: src/index.ts");
 	});

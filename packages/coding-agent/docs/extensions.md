@@ -100,6 +100,8 @@ Use each event’s declared result type rather than assuming every return value 
 
 Events cover resource discovery, sessions, agent and message lifecycle, providers, tools, and raw input.
 
+The `input` event receives raw text after extension commands are checked and before skill commands, inline skill mentions (`/skill:name`), and prompt templates are expanded. `pi.sendUserMessage()` enables this processing with `expandPromptTemplates: true`; it defaults to `false`.
+
 `before_agent_start` exposes both the current prompt and its structured `systemPromptOptions`. Prefer changing prompt sections, selected tools, or guidelines so Pi can append a transcript delta. Returning `systemPrompt`, or setting `forceSystemPrompt`, replaces the whole prompt for that run while the transcript continues recording the structured sections. Providers receive the forced text as their leading system prompt.
 
 `message_end` can replace a finalized message while preserving its role. `tool_call` can mutate input or block execution. `tool_result` handlers compose, with each handler seeing prior changes.

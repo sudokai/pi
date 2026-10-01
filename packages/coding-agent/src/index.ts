@@ -18,9 +18,7 @@ export {
 	type AgentSessionEvent,
 	type AgentSessionEventListener,
 	type ModelCycleResult,
-	type ParsedSkillBlock,
 	type PromptOptions,
-	parseSkillBlock,
 	type SessionStats,
 } from "./core/agent-session.ts";
 export { readStoredCredential } from "./core/auth-storage.ts";
@@ -318,6 +316,11 @@ export {
 	type SettingsManagerCreateOptions,
 	type TuiMode,
 } from "./core/settings-manager.ts";
+export {
+	type ParsedSkillBlock,
+	type ParsedSkillInvocation,
+	parseSkillBlocks,
+} from "./core/skill-block.ts";
 // Skills
 export {
 	formatSkillsForPrompt,

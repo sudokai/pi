@@ -10,6 +10,9 @@ const tokenStartRegex = new RegExp(`${autocompleteBoundaryRegex.source}$`, "u");
 // Opening wrappers that may precede a path in prose, mapped to their closing counterpart.
 const PATH_WRAPPERS: Record<string, string> = { "(": ")", "[": "]", "{": "}", "<": ">", "`": "`" };
 
+/** Command namespace for skills, e.g. "skill:diagnose". */
+const SKILL_COMMAND_PREFIX = "skill:";
+
 function toDisplayPath(value: string): string {
 	return value.replace(/\\/g, "/");
 }
@@ -70,6 +73,24 @@ function stripLeadingWrappers(token: string): string {
 		result = result.slice(1);
 	}
 	return result;
+}
+
+/**
+ * Return the slash-led token ending at the cursor (e.g. "/di" in "use /di"), or null.
+ * A slash token must start at a token boundary (start of text or after whitespace or an
+ * opening bracket) and must not contain whitespace or a path separator.
+ */
+export function extractSlashToken(textBeforeCursor: string): string | null {
+	return textBeforeCursor.match(/(?:^|[\s([{])(\/[^\s/]*)$/)?.[1] ?? null;
+}
+
+/**
+ * True when the cursor is at the start of the message: it sits on the message's first
+ * non-empty line (every line above cursorLine is blank). Shared by the provider and the
+ * editor so both use the same start-of-message rule.
+ */
+export function isAtMessageStart(lines: string[], cursorLine: number): boolean {
+	return lines.slice(0, cursorLine).every((line) => line.trim() === "");
 }
 
 function findUnclosedQuoteStart(text: string): number | null {
@@ -299,6 +320,11 @@ export interface AutocompleteProvider {
 	shouldTriggerFileCompletion?(lines: string[], cursorLine: number, cursorCol: number): boolean;
 }
 
+/** Command name for either a SlashCommand (name) or a plain AutocompleteItem (value). */
+function getCommandName(command: SlashCommand | AutocompleteItem): string {
+	return "name" in command ? command.name : command.value;
+}
+
 // Combined provider that handles both slash commands and file paths
 export class CombinedAutocompleteProvider implements AutocompleteProvider {
 	private commands: (SlashCommand | AutocompleteItem)[];
@@ -335,67 +361,47 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			};
 		}
 
-		const commandText = textBeforeCursor.trimStart();
-		if (!options.force && commandText.startsWith("/")) {
-			const spaceIndex = commandText.indexOf(" ");
-
-			if (spaceIndex === -1) {
-				const prefix = commandText.slice(1);
-				const commandItems = this.commands.map((cmd) => {
-					const name = "name" in cmd ? cmd.name : cmd.value;
-					const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
-					const desc = cmd.description ?? "";
-					const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
-					return {
-						name,
-						label: name,
-						description: fullDesc || undefined,
-					};
-				});
-
-				const bareNameMatches = fuzzyFilter(commandItems, prefix, (item) =>
-					item.name.startsWith("skill:") ? item.name.slice("skill:".length) : item.name,
-				);
-				const bareNameMatchSet = new Set(bareNameMatches);
-				const fullNameOnlyMatches = fuzzyFilter(
-					commandItems.filter((item) => item.name.startsWith("skill:") && !bareNameMatchSet.has(item)),
-					prefix,
-					(item) => item.name,
-				);
-				const filtered = [...bareNameMatches, ...fullNameOnlyMatches].map((item) => ({
-					value: item.name,
-					label: item.label,
-					...(item.description && { description: item.description }),
-				}));
-
-				if (filtered.length === 0) return null;
-
-				return {
-					items: filtered,
-					prefix: commandText,
-				};
+		if (!options.force) {
+			// Commands (/model, /skill:name, ...) are only meaningful when they start the
+			// message, so they are offered from the first line even when later lines have
+			// content. Leading whitespace still counts as the start.
+			const commandText = textBeforeCursor.trimStart();
+			const atCommandPosition = isAtMessageStart(lines, cursorLine) && commandText.startsWith("/");
+			if (atCommandPosition) {
+				const commandSuggestions = await this.getMessageStartCommandSuggestions(commandText);
+				if (commandSuggestions) {
+					return commandSuggestions;
+				}
+				// Not a known command (e.g. a path like "/tmp/x") or no argument matches:
+				// fall through so a later slash token still completes ("/tmp/x and /di").
 			}
 
-			const commandName = commandText.slice(1, spaceIndex);
-			const argumentText = commandText.slice(spaceIndex + 1);
+			// Inline slash tokens (e.g. "use /diag", or "/diag" on a later line) complete
+			// skills only. Other commands do not run mid-message. A bare slash does not
+			// fall back to filesystem paths; path completion requires explicit Tab.
+			const inlinePrefix = extractSlashToken(textBeforeCursor);
+			if (inlinePrefix) {
+				if (inlinePrefix.length > 1) {
+					const skillCommands = this.commands.filter((cmd) =>
+						getCommandName(cmd).startsWith(SKILL_COMMAND_PREFIX),
+					);
+					const filtered = this.getCommandSuggestions(skillCommands, inlinePrefix.slice(1));
 
-			const command = this.commands.find((cmd) => {
-				const name = "name" in cmd ? cmd.name : cmd.value;
-				return name === commandName;
-			});
-			if (!command || !("getArgumentCompletions" in command) || !command.getArgumentCompletions) {
+					if (filtered.length > 0) {
+						return {
+							items: filtered,
+							prefix: inlinePrefix,
+						};
+					}
+				}
 				return null;
 			}
 
-			const argumentSuggestions = await command.getArgumentCompletions(argumentText);
-			if (!Array.isArray(argumentSuggestions) || argumentSuggestions.length === 0) {
+			// A message-leading slash never falls through to filesystem path completion;
+			// paths there require explicit Tab.
+			if (atCommandPosition) {
 				return null;
 			}
-
-			return {
-				items: argumentSuggestions,
-				prefix: argumentText,
-			};
 		}
 
 		const pathMatch = this.extractPathPrefix(textBeforeCursor, options.force ?? false);
@@ -428,11 +434,17 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 		const adjustedAfterCursor =
 			isQuotedPrefix && hasTrailingQuoteInItem && hasLeadingQuoteAfterCursor ? afterCursor.slice(1) : afterCursor;
 
-		// Check if we're completing a slash command (prefix starts with "/" but NOT a file path)
-		// Slash commands are at the start of the line and don't contain path separators after the first /
-		const isSlashCommand = prefix.startsWith("/") && beforePrefix.trim() === "" && !prefix.slice(1).includes("/");
-		if (isSlashCommand) {
-			// This is a command name completion
+		// A command name completion is a slash-led token that needs a slash prepended:
+		// a message-leading command, or an inline skill token (which keeps its leading
+		// slash even after an earlier slash-led token, "/tmp/x and /di" ->
+		// "/tmp/x and /skill:diagnose "). Argument completions replace the token verbatim
+		// (beforePrefix starts with "/command "), and absolute paths carry their own slash.
+		const isCommandNameCompletion =
+			prefix.startsWith("/") &&
+			!prefix.slice(1).includes("/") &&
+			!item.value.startsWith("/") &&
+			(beforePrefix.trim() === "" || item.value.startsWith(SKILL_COMMAND_PREFIX));
+		if (isCommandNameCompletion) {
 			const newLine = `${beforePrefix}/${item.value} ${adjustedAfterCursor}`;
 			const newLines = [...lines];
 			newLines[cursorLine] = newLine;
@@ -497,6 +509,72 @@ export class CombinedAutocompleteProvider implements AutocompleteProvider {
 			cursorLine,
 			cursorCol: beforePrefix.length + cursorOffset,
 		};
+	}
+
+	// Command and argument suggestions for a message-leading slash ("/model",
+	// "/model /g"), or null when the leading token is not a known command with
+	// argument completions. Callers fall back to inline skill completion.
+	private async getMessageStartCommandSuggestions(textBeforeCursor: string): Promise<AutocompleteSuggestions | null> {
+		const spaceIndex = textBeforeCursor.indexOf(" ");
+
+		if (spaceIndex === -1) {
+			const filtered = this.getCommandSuggestions(this.commands, textBeforeCursor.slice(1));
+
+			if (filtered.length === 0) return null;
+
+			return {
+				items: filtered,
+				prefix: textBeforeCursor,
+			};
+		}
+
+		const commandName = textBeforeCursor.slice(1, spaceIndex);
+		const argumentText = textBeforeCursor.slice(spaceIndex + 1);
+
+		const command = this.commands.find((cmd) => getCommandName(cmd) === commandName);
+		if (!command || !("getArgumentCompletions" in command) || !command.getArgumentCompletions) {
+			return null;
+		}
+
+		const argumentSuggestions = await command.getArgumentCompletions(argumentText);
+		if (!Array.isArray(argumentSuggestions) || argumentSuggestions.length === 0) {
+			return null;
+		}
+
+		return {
+			items: argumentSuggestions,
+			prefix: argumentText,
+		};
+	}
+
+	// Fuzzy-match command names and shape them into autocomplete items.
+	private getCommandSuggestions(commands: (SlashCommand | AutocompleteItem)[], prefix: string): AutocompleteItem[] {
+		const commandItems = commands.map((cmd) => {
+			const name = getCommandName(cmd);
+			const hint = "argumentHint" in cmd && cmd.argumentHint ? cmd.argumentHint : undefined;
+			const desc = cmd.description ?? "";
+			const fullDesc = hint ? (desc ? `${hint} — ${desc}` : hint) : desc;
+			return {
+				name,
+				label: name,
+				description: fullDesc || undefined,
+			};
+		});
+
+		const bareNameMatches = fuzzyFilter(commandItems, prefix, (item) =>
+			item.name.startsWith(SKILL_COMMAND_PREFIX) ? item.name.slice(SKILL_COMMAND_PREFIX.length) : item.name,
+		);
+		const bareNameMatchSet = new Set(bareNameMatches);
+		const fullNameOnlyMatches = fuzzyFilter(
+			commandItems.filter((item) => item.name.startsWith(SKILL_COMMAND_PREFIX) && !bareNameMatchSet.has(item)),
+			prefix,
+			(item) => item.name,
+		);
+		return [...bareNameMatches, ...fullNameOnlyMatches].map((item) => ({
+			value: item.name,
+			label: item.label,
+			...(item.description && { description: item.description }),
+		}));
 	}
 
 	// Extract @ prefix for fuzzy file suggestions

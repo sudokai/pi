@@ -114,6 +114,202 @@ describe("CombinedAutocompleteProvider", () => {
 		});
 	});
 
+	describe("slash command and inline skill suggestions", () => {
+		const commands = [
+			{ name: "reload", description: "Reload session" },
+			{ name: "model", description: "Switch model" },
+			{ name: "skill:diagnose", description: "Diagnose bugs" },
+			{ name: "skill:review", description: "Review code" },
+		];
+
+		it("completes commands at message start", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const result = await getSuggestions(provider, ["/rel"], 0, 4);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "/rel");
+			assert.deepStrictEqual(
+				result?.items.map((item) => item.value),
+				["reload"],
+			);
+		});
+
+		it("completes skills inline in the middle of a line", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "please use /di";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "/di");
+			assert.deepStrictEqual(
+				result?.items.map((item) => item.value),
+				["skill:diagnose"],
+			);
+		});
+
+		it("completes skills at the start of a later line", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const lines = ["first line", "/di"];
+			const result = await getSuggestions(provider, lines, 1, 3);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "/di");
+			assert.deepStrictEqual(
+				result?.items.map((item) => item.value),
+				["skill:diagnose"],
+			);
+		});
+
+		it("does not offer non-skill commands inline", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "please /relo";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.strictEqual(result, null);
+		});
+
+		it("does not fall back to filesystem paths for an inline slash", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "please /";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.strictEqual(result, null);
+		});
+
+		it("completes skills after a slash-led earlier token on the same line", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "/tmp/x and /di";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "/di");
+			assert.deepStrictEqual(
+				result?.items.map((item) => item.value),
+				["skill:diagnose"],
+			);
+		});
+
+		it("completes skills after a slash-led token on an earlier line", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const lines = ["/tmp/x", "/di"];
+			const result = await getSuggestions(provider, lines, 1, 3);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "/di");
+			assert.deepStrictEqual(
+				result?.items.map((item) => item.value),
+				["skill:diagnose"],
+			);
+		});
+
+		it("does not fall back to filesystem paths for a bare slash after a slash-led token", async () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "/tmp/x and /";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.strictEqual(result, null);
+		});
+
+		it("completes command arguments for a known command after '/model /g'", async () => {
+			const provider = new CombinedAutocompleteProvider(
+				[
+					{
+						name: "model",
+						description: "Switch model",
+						getArgumentCompletions: (argumentPrefix) =>
+							argumentPrefix.startsWith("/g") ? [{ value: "gpt-5", label: "gpt-5" }] : null,
+					},
+				],
+				"/tmp",
+			);
+			const line = "/model /g";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.notEqual(result, null);
+			assert.strictEqual(result?.prefix, "/g");
+			assert.deepStrictEqual(
+				result?.items.map((item) => item.value),
+				["gpt-5"],
+			);
+		});
+
+		it("applies inline skill completion keeping the leading slash after a slash-led token", () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "/tmp/x and /di";
+			const cursorCol = line.length;
+
+			const applied = provider.applyCompletion(
+				[line],
+				0,
+				cursorCol,
+				{ value: "skill:diagnose", label: "skill:diagnose" },
+				"/di",
+			);
+
+			assert.strictEqual(applied.lines[0], "/tmp/x and /skill:diagnose ");
+			assert.strictEqual(applied.cursorCol, applied.lines[0].length);
+		});
+
+		it("applies command argument completion without adding a slash for '/model /g'", () => {
+			const provider = new CombinedAutocompleteProvider(commands, "/tmp");
+			const line = "/model /g";
+
+			const applied = provider.applyCompletion([line], 0, line.length, { value: "gpt-5", label: "gpt-5" }, "/g");
+
+			assert.strictEqual(applied.lines[0], "/model gpt-5");
+		});
+	});
+
+	describe("message-leading slash and path completion boundaries", () => {
+		const commands = [
+			{ name: "reload", description: "Reload session" },
+			{ name: "skill:diagnose", description: "Diagnose bugs" },
+		];
+		let baseDir = "";
+
+		beforeEach(() => {
+			baseDir = mkdtempSync(join(tmpdir(), "pi-autocomplete-slash-"));
+		});
+
+		afterEach(() => {
+			rmSync(baseDir, { recursive: true, force: true });
+		});
+
+		test("completes relative paths after whitespace mid-line without Tab", async () => {
+			setupFolder(baseDir, {
+				dirs: ["src"],
+				files: {
+					"src/index.ts": "export {};",
+				},
+			});
+
+			const provider = new CombinedAutocompleteProvider(commands, baseDir);
+			const line = "see src/";
+			const result = await getSuggestions(provider, [line], 0, line.length);
+
+			assert.notEqual(result, null, "Should complete paths after a space without Tab");
+			assert.ok(result?.items.some((item) => item.value === "src/index.ts"));
+		});
+
+		test(
+			"does not auto-complete a message-leading absolute path without Tab",
+			{ skip: process.platform === "win32" },
+			async () => {
+				setupFolder(baseDir, {
+					dirs: ["src"],
+				});
+
+				// An absolute path into the real temp baseDir; suggestions must not list
+				// src/ without an explicit Tab.
+				const provider = new CombinedAutocompleteProvider(commands, baseDir);
+				const line = `${baseDir}/sr`;
+				const result = await getSuggestions(provider, [line], 0, line.length);
+
+				assert.strictEqual(result, null);
+			},
+		);
+	});
+
 	describe("fd @ file suggestions", { skip: !isFdInstalled }, () => {
 		let rootDir = "";
 		let baseDir = "";
