@@ -99,6 +99,10 @@ When closing issues via commit:
 
 For testing pi's interactive mode, load and follow [.pi/skills/interactive-testing.md](.pi/skills/interactive-testing.md).
 
+## Updating the local pi installation
+
+To update the source-linked `pi` command, load and follow [.pi/skills/update-local-install.md](.pi/skills/update-local-install.md).
+
 ## Changelog
 
 Location: `packages/*/CHANGELOG.md` (one per package).
